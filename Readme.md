@@ -547,6 +547,55 @@ This technique effectively bypasses multiple modern kernel security mechanisms:
 
 ---
 
+### 🕵️ EDR sidestep — using the hijack itself as the kernel R/W primitive
+
+The most common BYOVD detection signal isn't the *technique* — it's the **volume of IOCTLs the vulnerable driver receives**. RTCore64 in particular has well-known IOCTL signatures; an EDR that sees the same process pinging it dozens of times per second has a reliable IOC even without ever inspecting *what's* being read.
+
+This technique gives you a way to **collapse that pattern to a single setup burst**. Once the hijack slot is established, you don't need to keep talking to RTCore64 — the hijack itself becomes your kernel R/W primitive:
+
+- **Kernel writes:** point the slot at `nt!memcpy(dest, src, len)` and write from a user buffer into kernel memory. That's exactly how `/privesc` and `/ppl` already work — the token swap and the `_EPROCESS.Protection` flip both happen **through the hijack**, not back through RTCore64.
+- **Kernel reads:** same trick — point the slot at `nt!memcpy(user_buf, kernel_src, len)` (or any read accessor with a similar shape) and the data lands in user space without an RTCore64 IOCTL.
+
+#### The threat-model shift, visually
+
+```
+                       RTCore64 IOCTLs over time  →
+Naive BYOVD chain      █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █
+                       ▲                                             ▲
+                       setup                                 every R/W call
+                                (sustained — easy to alert on the rate)
+
+Bootstrap-then-quiet   █ █ █ █ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░ ░
+                       ▲       └──────── NtSetQuotaInformationFile ────┘
+                       setup   syscalls — indistinguishable from normal
+                               process syscall traffic
+```
+
+#### Honest scope — what this does and doesn't hide
+
+RTCore64 still has to surface during **initial setup**. Specifically, the IOCTLs needed before the hijack is live:
+
+1. Read `KeServiceDescriptorTableShadow` → resolve `KiServiceTable` address.
+2. Read the original `KiServiceTable[NtSetQuotaInformationFile]` entry (so we can restore it later).
+3. Read the PDE covering the table page.
+4. Write the PDE with the R/W bit flipped.
+5. Write the new `KiServiceTable` entry pointing at the first target routine.
+
+That's the bootstrap burst. After step 5, every subsequent kernel R/W can go through the hijack — no more RTCore64 traffic until cleanup (and even cleanup can in principle be routed through the hijack, leaving only the final PDE-restore write).
+
+So the vulnerable driver is **never invisible** — it's visible for a short, bounded setup burst and then goes quiet. An EDR that already alerts on RTCore64 *loading*, or on the very first IOCTL, still catches the bootstrap. What this defeats is the **sustained IOCTL pattern** that long-lived implants would otherwise generate.
+
+#### Where this is useful
+
+- **Long-lived implants** that need ongoing kernel R/W (token swaps on freshly spawned processes, periodic callback unhooks, on-demand object hides). After the one-time bootstrap, every subsequent R/W shows up as `NtSetQuotaInformationFile` syscall traffic.
+- **Heuristic IOCTL-rate detections.** Many EDRs key on the *rate* of suspicious IOCTLs to a known-vulnerable driver more than on the first one. Collapsing steady-state traffic to a single setup burst sidesteps that class of heuristic.
+- **Reducing forensic noise.** ETW providers that log driver IRPs see one short burst instead of a continuous stream correlated 1:1 with the implant's kernel operations.
+- **Constraining the IOC window.** If incident responders look for "process X talked to RTCore64 between T and T+10s," they get a tiny window to correlate against — versus the entire implant lifetime.
+
+> Combined with the HVCI/VBS bypass story above, the full claim is: this technique runs **on a fully-hardened Win11 box** while leaving **the minimum possible BYOVD telemetry footprint** for an arbitrary-kernel-R/W primitive — one setup burst, then ordinary-looking syscalls.
+
+---
+
 ### ✅ POC (Proof of Concept)
 
 To run this POC successfully, you must execute it as SYSTEM. This is because the code uses EnumDeviceDrivers to leak the kernel base address — a technique that no longer works from medium integrity on recent versions of Windows 11.
